@@ -16,10 +16,11 @@ parser = argparse.ArgumentParser(description='darts_test')
 parser.add_argument('--integers2one_hot', type=bool, default=True, help='whether to transform integers -> one_hot')
 parser.add_argument('--train_batch_size', default=1000, type=int)
 parser.add_argument('--test_batch_size', default=100, type=int)
-parser.add_argument('--seed', type=int, default=2, help='random seed')
+parser.add_argument('--seed', type=int, default=6, help='random seed')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--which_assistant', type=int, default=0, help='0 for tiny, 1 for small tiny')
-parser.add_argument('--ns', default=True, type=bool, help='whether to forbidden skip in assistant space')
+parser.add_argument('--ns', default=False, type=bool, help='whether to forbidden skip in assistant space')
+parser.add_argument('--using_dataset', default='all', type=str, choices=['all', '101', '201'])
 parser.add_argument('--show_figure', default=False, type=bool)
 parser.add_argument('--top_k', default=True, type=bool)
 parser.add_argument('--figure_index', default=2, type=int, help='the index of the saving figure')
@@ -38,7 +39,7 @@ if __name__ == '__main__':
 
     train_dataloader, percentile = get_train_dataloader(normal_layer=normal_layers,
                                                         train_batch_size=args.train_batch_size,
-                                                        percentile=True)
+                                                        percentile=True, using_dataset=args.using_dataset)
     target_dataloader = get_target_train_dataloader(args.train_batch_size, dataset_num=len(data['dataset']),
                                                     dataset=data['dataset'])
     # choose which assistant space to use

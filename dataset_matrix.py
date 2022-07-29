@@ -20,7 +20,7 @@ class Dataset_Train(Dataset):
     MEAN201 = 0.853237
     STD201 = 0.065461
 
-    def __init__(self, split_type, normal_layer, percentile):
+    def __init__(self, split_type, normal_layer, percentile, using_dataset='all'):
         '''
         :param split_type: int type
         0: normal_cell0
@@ -60,7 +60,15 @@ class Dataset_Train(Dataset):
 
         # dataset101 and dataset201
         dataset_num = 0
-        for DataSet in [Dataset_Metrics101, Dataset_Metrics201]:
+        if using_dataset == 'all':
+            dataset_list = [Dataset_Metrics101, Dataset_Metrics201]
+        elif using_dataset == '101':
+            dataset_list = [Dataset_Metrics101]
+        elif using_dataset == '201':
+            dataset_list = [Dataset_Metrics201]
+        else:
+            raise NotImplementedError
+        for DataSet in dataset_list:
             dataset_num += 1
             for index in DataSet:
                 fixed_metrics = DataSet[index]['fixed_metrics']
@@ -138,9 +146,9 @@ class Dataset_Darts(Dataset):
             # original description
             if dataset_num == None:
                 self.dataset = darts.DataSetDarts(dataset_num=1e6)
-                darts_save_path = 'path/darts_dataset.pkl'
-                with open(darts_save_path, 'wb') as file:
-                    pickle.dump(self.dataset, file)
+                # darts_save_path = 'path/darts_dataset.pkl'
+                # with open(darts_save_path, 'wb') as file:
+                #     pickle.dump(self.dataset, file)
             else:
                 self.dataset = darts.DataSetDarts(dataset_num=dataset_num, dataset=dataset)
         elif dataset_type == 'tiny':

@@ -1,4 +1,5 @@
 import pickle
+from humanfriendly import time_units
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,10 +28,10 @@ def graph_pooling(inputs, num_vertices):
     return torch.div(out, num_vertices.unsqueeze(-1).expand_as(out))
 
 
-def get_train_dataloader(normal_layer, train_batch_size, percentile=False):
+def get_train_dataloader(normal_layer, train_batch_size, percentile=False, using_dataset='all'):
     train_dataloader_set = []
     for i in range(4):
-        train_dataset = Dataset_Train(split_type=i, normal_layer=normal_layer, percentile=percentile)
+        train_dataset = Dataset_Train(split_type=i, normal_layer=normal_layer, percentile=percentile, using_dataset=using_dataset)
         train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
         train_dataloader_set.append(train_dataloader)
     if percentile:
@@ -119,6 +120,7 @@ class DomainAdaptationPredictor(nn.Module):
     def forward(self, source, target, s_label, K):
         loss = 0
         source = self.NeuralPredictor(source)
+        #  delete them if train on target domain
         if self.training == True:
             target = self.NeuralPredictor(target)
             t_label = self.fc(target).view(-1)
@@ -130,6 +132,7 @@ class DomainAdaptationPredictor(nn.Module):
             t_label = torch.from_numpy(t_label)
 
             loss += lmmd_loss.get_loss(source, target, s_label, t_label)
+            
             # loss += mmd.mmd_rbf_noaccelerate(source, target)
             # if loss < 0:
             #     print()
@@ -245,15 +248,17 @@ class GCN_predictor():
                                     epoch + 1, epochs, step + 1, len(data_loader), lr, meters)
                 lr_scheduler.step()
 
-    def train_without_domain_adaptation(self, data_loader_set, epochs=50, init_lr=2e-3, wd=1e-3,
-              train_print_freq=10):
+    def train_without_domain_adaptation(self, data_loader_set, label, epochs=50, init_lr=5e-1, wd=1e-3):
         logger = get_logger()
 
         net_set = [self.normal_predictor0, self.normal_predictor1, self.reduction_predictor0, self.reduction_predictor1]
-        assert len(net_set) == len(data_loader_set)
+        label = torch.tensor(label)
+        label = label.cuda()
         i = -1
         print('CUDA available:', torch.cuda.is_available())
-        for net, data_loader in zip(net_set, data_loader_set):
+        tmp_iter = iter(data_loader_set)
+        batch = tmp_iter.next()
+        for net in net_set:
             i += 1
             criterion = nn.MSELoss()
             net.cuda()
@@ -265,36 +270,33 @@ class GCN_predictor():
                 meters = AverageMeterGroup()
                 lr = optimizer.param_groups[0]["lr"]
 
-                for step, batch in enumerate(data_loader):
-                    batch = to_cuda(batch)
-                    s_label = batch["val_acc"].to(torch.float)
-                    try:
-                        target_data = target_iter.next()
-                    except Exception:
-                        target_iter = iter(target_data_loader)
-                        target_data = target_iter.next()
-                    target_data_set = self.split_target_dataset(target_data)
-                    target_data_set = to_cuda(target_data_set)
+                batch_set = self.split_target_dataset(batch)
+                for j in range(4):
+                    batch_set[j] = to_cuda(batch_set[j])
+                
+                target, s_label, K = None, None, None
+                predict, mmd_loss = net(batch_set[i], target, s_label, K)
+                optimizer.zero_grad()
+                loss = criterion(predict, label)
+                loss.backward()
+                optimizer.step()
+                # seconde train
+                # if i==0:
+                #     se_i = 1
+                # elif i==1:
+                #     se_i = 0
+                # elif i==2:
+                #     se_i = 3
+                # else:
+                #     se_i = 2
+                # predict, mmd_loss = net(batch_set[se_i], target, s_label, K)
+                # optimizer.zero_grad()
+                # loss = criterion(predict, label)
+                # loss.backward()
+                # optimizer.step()
+                print(epoch, loss)
 
-                    predict, mmd_loss = net(batch, target_data_set[i], s_label, k)
-                    optimizer.zero_grad()
-                    loss = criterion(predict, s_label)
-                    lambd = 2 / (1 + math.exp(-10 * epoch / epochs)) - 1
-                    # if mmd_loss < 1e-6:
-                    #     # if mmd loss is too small, ignore it
-                    #     lambd = 0
-                    # lambd = 0
-                    mmd_loss = mmd_loss[0]
-                    loss += lambd * mmd_loss
-                    loss.backward()
-                    optimizer.step()
-
-                    meters.update({"loss": loss.item(), "mmd_loss": mmd_loss}, n=s_label.size(0))
-                    if (train_print_freq and step % train_print_freq == 0) or \
-                            step + 1 == len(data_loader):
-                        logger.info("Epoch [%d/%d] Step [%d/%d] lr = %.3e  %s",
-                                    epoch + 1, epochs, step + 1, len(data_loader), lr, meters)
-                lr_scheduler.step()
+            lr_scheduler.step()
 
     def predict(self, pred_data_loader, normal_layer):
         normal_rate = normal_layer / (normal_layer + 2)
@@ -348,14 +350,14 @@ if __name__ == '__main__':
     else:
         raise ValueError('the normal_type should be chosen from [\'cifar\', \'image\']')
     train_dataloader_set, percentile = get_train_dataloader(normal_layer, args.train_batch_size, percentile=True)
-    darts_save_path = 'path/darts_dataset.pkl'
-    if os.path.exists(darts_save_path):
-        print('load dataset.')
-        with open(darts_save_path, 'rb') as file:
-            saved_darts_dataset = pickle.load(file)
-        Darts = Dataset_Darts(dataset_num=1e6, dataset=saved_darts_dataset.dataset)
-    else:
-        Darts = Dataset_Darts()
+    # darts_save_path = 'path/darts_dataset.pkl'
+    # if os.path.exists(darts_save_path):
+    #     print('load dataset.')
+    #     with open(darts_save_path, 'rb') as file:
+    #         saved_darts_dataset = pickle.load(file)
+    #     Darts = Dataset_Darts(dataset_num=1e6, dataset=saved_darts_dataset.dataset)
+    # else:
+    Darts = Dataset_Darts()
     target_dataloader = DataLoader(Darts, batch_size=args.train_batch_size, shuffle=True)
     # assistant dataloader
     ### Maybe need to add a function saving tiny darts
