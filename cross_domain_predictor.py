@@ -14,6 +14,8 @@ import os
 import time
 import mmd
 import math
+import coral
+from DANN import DANN
 
 
 def normalize_adj(adj):
@@ -117,22 +119,26 @@ class DomainAdaptationPredictor(nn.Module):
         self.fc = nn.Linear(128, 1, bias=False)
         self.percentile = percentile
 
-    def forward(self, source, target, s_label, K):
+    def forward(self, source, target, s_label, K, kernel_type='rbf', loss_type='lmmd'):
         loss = 0
         source = self.NeuralPredictor(source)
-        #  delete them if train on target domain
         if self.training == True:
             target = self.NeuralPredictor(target)
             t_label = self.fc(target).view(-1)
-            lmmd_loss = mmd.LMMD_loss(class_num=K)
+            lmmd_loss = mmd.LMMD_loss(class_num=K, kernel_type=kernel_type)
             K_percentile = self.percentile[K - 1]
             s_label = self.one_hot_classification(K_percentile, s_label)
             t_label = self.one_hot_classification(K_percentile, t_label)
             s_label = torch.from_numpy(s_label)
             t_label = torch.from_numpy(t_label)
 
-            loss += lmmd_loss.get_loss(source, target, s_label, t_label)
-            
+            if loss_type == 'lmmd':
+                loss += lmmd_loss.get_loss(source, target, s_label, t_label)
+            elif loss_type == 'coral':
+                loss += coral.CORAL(source, target)
+                loss = [loss]
+            else:
+                raise ValueError('loss_type error!')
             # loss += mmd.mmd_rbf_noaccelerate(source, target)
             # if loss < 0:
             #     print()
@@ -157,17 +163,65 @@ class DomainAdaptationPredictor(nn.Module):
         return one_hot_label
 
 
-class GCN_predictor():
-    def __init__(self, percentile, gcn_hidden=144):
-        self.normal_predictor0 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
-        self.normal_predictor1 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
-        self.reduction_predictor0 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
-        self.reduction_predictor1 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+class AdvDomainAdaptationPredictor(nn.Module):
+    def __init__(self, percentile, gcn_hidden):
+        super(AdvDomainAdaptationPredictor, self).__init__()
+        self.NeuralPredictor = NeuralPredictor(gcn_hidden=gcn_hidden)
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(128, 1, bias=False)
+        # no uses of percentile
+        self.percentile = percentile
+        self.domain_classifier = DANN(input_size=128)
 
-    # def accuracy_mse(self, predict, target, scale=100.):
-    #     predict = Dataset_Train.denormalize(predict.detach()) * scale
-    #     target = Dataset_Train.denormalize(target) * scale
-    #     return F.mse_loss(predict, target)
+    def forward(self, source, target):
+        loss = 0
+        source = self.NeuralPredictor(source)
+        source_batch_size = source.shape[0]
+        if self.training == True:
+            target = self.NeuralPredictor(target)
+            loss_domain = torch.nn.NLLLoss()
+            loss_domain = loss_domain.cuda()
+
+            # add source domain loss
+            # domain label = 0
+            domain_label = torch.zeros(source_batch_size)
+            domain_label = domain_label.long()
+            domain_label = domain_label.cuda()
+
+            domain_output = self.domain_classifier(source)
+            loss += loss_domain(domain_output, domain_label)
+
+            # add target domain loss
+            # domain label = 1
+            target_batch_size = target.shape[0]
+            domain_label = torch.ones(target_batch_size)
+            domain_label = domain_label.long()
+            domain_label = domain_label.cuda()
+
+            domain_output = self.domain_classifier(target)
+            loss += loss_domain(domain_output, domain_label)
+
+        source = self.dropout(source)
+        source = self.fc(source).view(-1)
+        return source, loss
+
+
+class GCN_predictor():
+    def __init__(self, percentile, gcn_hidden=144, speed='cos', K=3, is_adv=False):
+        if is_adv == False:
+            self.normal_predictor0 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.normal_predictor1 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.reduction_predictor0 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.reduction_predictor1 = DomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+        else:
+            # using Adversarial loss
+            self.normal_predictor0 = AdvDomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.normal_predictor1 = AdvDomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.reduction_predictor0 = AdvDomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+            self.reduction_predictor1 = AdvDomainAdaptationPredictor(percentile, gcn_hidden=gcn_hidden)
+        self.speed = speed
+        self._K = K
+        self._is_adv = is_adv
 
     def split_target_dataset(self, batch):
         batch_set = []
@@ -181,8 +235,10 @@ class GCN_predictor():
         return batch_set
 
     def train(self, data_loader_set, target_data_loader, assistant_data_loader, epochs=50, init_lr=2e-3, wd=1e-3,
-              train_print_freq=10, K=3, assistant_rate=0.1):
+              train_print_freq=10, assistant_rate=0.15, loss_type='lmmd', kernel_type='rbf'):
         logger = get_logger()
+        # assign K
+        K = self._K
         # calculate assistant epochs
         assistant_epochs = epochs * assistant_rate
         # if do not use assistant_data_loader
@@ -193,7 +249,6 @@ class GCN_predictor():
         net_set = [self.normal_predictor0, self.normal_predictor1, self.reduction_predictor0, self.reduction_predictor1]
         assert len(net_set) == len(data_loader_set)
         i = -1
-        print('CUDA available:', torch.cuda.is_available())
         for net, data_loader in zip(net_set, data_loader_set):
             i += 1
             criterion = nn.MSELoss()
@@ -203,8 +258,14 @@ class GCN_predictor():
             net.train()
             for epoch in range(epochs):
                 # calculate k first
-                # k = 4
-                k = K - math.floor(math.cos((epoch + 1) / epochs * math.pi / 2) * K)
+                # k = 2
+                if self.speed == 'cos':
+                    k = K - math.floor(math.cos((epoch + 1) / epochs * math.pi / 2) * K)
+                elif self.speed == 'sin':
+                    k = math.floor(math.cos((epochs - (epoch + 1)) / epochs * math.pi / 2) * K) + 1
+                else:
+                    # linear
+                    k = math.floor((epoch + 1) / epochs * K) + 1
                 logger.info('Epoch: {}, k: {}'.format(epoch + 1, k))
 
                 meters = AverageMeterGroup()
@@ -228,7 +289,16 @@ class GCN_predictor():
                     target_data_set = self.split_target_dataset(target_data)
                     target_data_set = to_cuda(target_data_set)
 
-                    predict, mmd_loss = net(batch, target_data_set[i], s_label, k)
+                    if self._is_adv == False:
+                        # not use Adversarial loss
+                        predict, mmd_loss = net(batch, target_data_set[i], s_label, k, loss_type=loss_type,
+                                                kernel_type=kernel_type)
+                        mmd_loss = mmd_loss[0]
+                    else:
+                        # using Adversarial loss
+                        predict, domain_loss = net(batch, target_data_set[i])
+                        # maybe rename the mmd_loss
+                        mmd_loss = domain_loss
                     optimizer.zero_grad()
                     loss = criterion(predict, s_label)
                     lambd = 2 / (1 + math.exp(-10 * epoch / epochs)) - 1
@@ -236,12 +306,13 @@ class GCN_predictor():
                     #     # if mmd loss is too small, ignore it
                     #     lambd = 0
                     # lambd = 0
-                    mmd_loss = mmd_loss[0]
                     loss += lambd * mmd_loss
+                    # if torch.isnan(loss):
+                    #     break
                     loss.backward()
                     optimizer.step()
 
-                    meters.update({"loss": loss.item(), "mmd_loss": mmd_loss}, n=s_label.size(0))
+                    meters.update({"loss": loss.item(), "DA_loss": mmd_loss}, n=s_label.size(0))
                     if (train_print_freq and step % train_print_freq == 0) or \
                             step + 1 == len(data_loader):
                         logger.info("Epoch [%d/%d] Step [%d/%d] lr = %.3e  %s",
@@ -249,8 +320,6 @@ class GCN_predictor():
                 lr_scheduler.step()
 
     def train_without_domain_adaptation(self, data_loader_set, label, epochs=50, init_lr=5e-1, wd=1e-3):
-        logger = get_logger()
-
         net_set = [self.normal_predictor0, self.normal_predictor1, self.reduction_predictor0, self.reduction_predictor1]
         label = torch.tensor(label)
         label = label.cuda()
@@ -316,7 +385,11 @@ class GCN_predictor():
                     net.eval()
                     # no target in evaluation stage
                     target, s_label, K = None, None, None
-                    predict, mmd_loss = net(batch_set[j], target, s_label, K)
+                    if self._is_adv == False:
+                        predict, mmd_loss = net(batch_set[j], target, s_label, K)
+                    else:
+                        # using adversarial network
+                        predict, _ = net(batch_set[j], target)
                     predict = predict.cpu().detach().numpy()
                     predict_list.append(predict)
 

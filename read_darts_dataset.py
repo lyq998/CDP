@@ -14,17 +14,22 @@ data = torch.load(filename)
 
 parser = argparse.ArgumentParser(description='darts_test')
 parser.add_argument('--integers2one_hot', type=bool, default=True, help='whether to transform integers -> one_hot')
-parser.add_argument('--train_batch_size', default=1000, type=int)
+parser.add_argument('--train_batch_size', default=500, type=int)
 parser.add_argument('--test_batch_size', default=100, type=int)
 parser.add_argument('--seed', type=int, default=6, help='random seed')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--which_assistant', type=int, default=0, help='0 for tiny, 1 for small tiny')
-parser.add_argument('--ns', default=False, type=bool, help='whether to forbidden skip in assistant space')
+parser.add_argument('--ns', default=True, type=bool, help='whether to forbidden skip in assistant space')
+parser.add_argument('--increasing_speed', default='cos', type=str, help='cos: faster, linear: const, sin: slower')
+parser.add_argument('-K', '--max_subdomains', default=3, type=int, help='the max number of subdomains')
+parser.add_argument('--kernel_type', default='rbf', type=str, help='choice from rbf, laplace, and rqk')
 parser.add_argument('--using_dataset', default='all', type=str, choices=['all', '101', '201'])
 parser.add_argument('--show_figure', default=False, type=bool)
 parser.add_argument('--top_k', default=True, type=bool)
 parser.add_argument('--figure_index', default=2, type=int, help='the index of the saving figure')
 # parser.add_argument('--predictor', type=str, default='GCN', choices=['RF', 'GCN'])
+parser.add_argument('--loss_type', default='lmmd', type=str, help='lmmd, coral')
+parser.add_argument('--is_adv', default=False, type=bool, help='Whether using adversarial loss')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -50,9 +55,11 @@ if __name__ == '__main__':
     Tiny_darts = Dataset_Darts(dataset_num=len(data['dataset']), dataset_type=dataset_type, ns=args.ns)
     assistant_dataloader = DataLoader(Tiny_darts, batch_size=args.train_batch_size, shuffle=True)
 
-    predictor = GCN_predictor(percentile)
+    K = args.max_subdomains
+    predictor = GCN_predictor(percentile, speed=args.increasing_speed, K=K, is_adv=args.is_adv)
     # add assistant_dataloader
-    predictor.train(train_dataloader, target_dataloader, assistant_dataloader)
+    predictor.train(train_dataloader, target_dataloader, assistant_dataloader, loss_type=args.loss_type,
+                    kernel_type=args.kernel_type)
 
     Darts_Matrix = Dataset_Darts(dataset_num=len(data['dataset']), dataset=data['dataset'])
     dataloader_darts = DataLoader(Darts_Matrix, batch_size=args.test_batch_size, shuffle=False)
@@ -64,7 +71,7 @@ if __name__ == '__main__':
         # acsend
         indexs = np.argsort(true_y)
         for k in [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]:
-            top_indexs = indexs[:k]
+            top_indexs = indexs[-k:]
             top_true_y, top_pred_y = [], []
             for i in top_indexs:
                 top_true_y.append(true_y[i])
